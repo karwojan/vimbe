@@ -12,11 +12,13 @@ class CodexBuffers:
         self.output_buffer.name = "CODEX output"
         self.output_buffer.options["buftype"] = "nofile"
         self.output_buffer.options["modifiable"] = False
+        self.output_buffer.options["swapfile"] = False
 
         self.input_buffer = vim.buffers[bufadd("")]
         bufload(self.input_buffer.number)
         self.input_buffer.name = "CODEX prompt"
         self.input_buffer.options["buftype"] = "nofile"
+        self.input_buffer.options["swapfile"] = False
 
     def _find_window(self, buffer: vim.Buffer) -> vim.Window | None:
         # vim.windows is a sequence, which we have to search over
