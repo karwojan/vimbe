@@ -1,49 +1,55 @@
-import vim
+import re
+from typing import Callable, Literal
 
-from codex_protocol_submission import (
-    Submission,
-    SubmissionOperation,
-    Interrupt,
-    TextInput,
-    UserInput,
-    ExecApproval,
-    PatchApproval,
-    ReviewDecision,
-)
+import vim
 from codex_protocol_event import (
-    Event,
     AgentMessageEvent,
     AgentReasoningEvent,
-    ErrorEvent,
-    TaskStarted,
-    TaskCompleteEvent,
-    ExecCommandEndEvent,
-    ExecApprovalRequestEvent,
     ApplyPatchApprovalRequestEvent,
+    ErrorEvent,
+    Event,
+    ExecApprovalRequestEvent,
+    ExecCommandBeginEvent,
+    ExecCommandEndEvent,
+    PatchApplyBeginEvent,
     PatchApplyEndEvent,
+    TaskCompleteEvent,
+    TaskStarted,
+)
+from codex_protocol_submission import (
+    ExecApproval,
+    Interrupt,
+    PatchApproval,
+    ReviewDecision,
+    Submission,
+    SubmissionOperation,
+    TextInput,
+    UserInput,
 )
 
 # functions handlers
 bufadd = vim.Function("bufadd")
 bufload = vim.Function("bufload")
+timer_start = vim.Function("timer_start")
 
 
 class CodexBuffers:
     def __init__(
         self,
-        input_buffer_setup_commands: list[str] = None,
-        output_buffer_setup_commands: list[str] = None,
-    ):
+        input_buffer_setup_commands: list[str] | None = None,
+        output_buffer_setup_commands: list[str] | None = None,
+    ) -> None:
         self.input_buffer_setup_commands = input_buffer_setup_commands
         self.output_buffer_setup_commands = output_buffer_setup_commands
 
         # vim.buffers is a mapping nr->buffer
         self.output_buffer = vim.buffers[bufadd("")]
         bufload(self.output_buffer.number)
-        self.output_buffer.name = "CODEX output"
+        self.output_buffer.name = "CODEX output [READY]"
         self.output_buffer.options["buftype"] = "nofile"
         self.output_buffer.options["modifiable"] = False
         self.output_buffer.options["swapfile"] = False
+        self.output_buffer.options["filetype"] = "codexoutput"
 
         self.input_buffer = vim.buffers[bufadd("")]
         bufload(self.input_buffer.number)
@@ -58,7 +64,7 @@ class CodexBuffers:
 
     def append_output(self, text: str) -> None:
         self.output_buffer.options["modifiable"] = True
-        self.output_buffer.append(text.splitlines())
+        self.output_buffer.append(text.splitlines() + [""])
         self.output_buffer.options["modifiable"] = False
         output_window = self._find_window(self.output_buffer)
         if output_window is not None and output_window.height > 0:
@@ -67,7 +73,24 @@ class CodexBuffers:
             vim.command("normal G")
             vim.current.window = old_current_window
 
-    def hide(self):
+    def replace_last_output_line(self, pattern: str, repl: str) -> None:
+        self.output_buffer.options["modifiable"] = True
+        for idx in reversed(range(len(self.output_buffer))):
+            line = self.output_buffer[idx]
+            if re.search(pattern, line) is not None:
+                self.output_buffer[idx] = re.sub(pattern, repl, line)
+        self.output_buffer.options["modifiable"] = False
+
+    def show_status_in_input(self, message: str) -> None:
+        self.input_buffer.options["modifiable"] = True
+        self.input_buffer[:] = message.splitlines()
+        self.input_buffer.options["modifiable"] = False
+
+    def hide_status_in_input(self) -> None:
+        self.input_buffer.options["modifiable"] = True
+        self.input_buffer[:] = []
+
+    def hide(self) -> None:
         output_window = self._find_window(self.output_buffer)
         if output_window is not None:
             vim.command(f"{output_window.number}hide")
@@ -75,11 +98,12 @@ class CodexBuffers:
         if input_window is not None:
             vim.command(f"{input_window.number}hide")
 
-    def show(self):
+    def show(self) -> None:
         vim.command(f"botright vertical sbuffer {self.output_buffer.number}")
         output_window = self._find_window(self.output_buffer)
-        output_window.width = 60
+        output_window.width = 70
         vim.current.window = output_window
+        vim.command("syntax on")
         if self.output_buffer_setup_commands is not None:
             for cmd in self.output_buffer_setup_commands:
                 vim.command(cmd)
@@ -91,7 +115,7 @@ class CodexBuffers:
             for cmd in self.input_buffer_setup_commands:
                 vim.command(cmd)
 
-    def switch(self):
+    def switch(self) -> None:
         if (
             self._find_window(self.input_buffer) is None
             or self._find_window(self.output_buffer) is None
@@ -105,7 +129,7 @@ class CodexBuffers:
 class CodexSession:
     sessions: list["CodexSession"] = []
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.session_idx = len(self.sessions)
         self.sessions.append(self)
 
@@ -131,87 +155,120 @@ class CodexSession:
 
         self.codex_buffers = CodexBuffers(
             input_buffer_setup_commands=[
-                f"nmap <buffer> <Enter> :py3 codex.CodexSession.sessions[{self.session_idx}].send_user_message()<CR>"
+                f"nmap <buffer> <Enter> :py3 codex.CodexSession.sessions[{self.session_idx}].send_user_message()<CR>",
+                f"nmap <buffer> <C-C> :py3 codex.CodexSession.sessions[{self.session_idx}].interrupt()<CR>",
+                f"nmap <buffer> <C-A> :py3 codex.CodexSession.sessions[{self.session_idx}].approval(codex.ReviewDecision.APPROVED)<CR>",
+                f"nmap <buffer> <C-D> :py3 codex.CodexSession.sessions[{self.session_idx}].approval(codex.ReviewDecision.DENIED)<CR>",
             ]
         )
         self.codex_buffers.show()
 
-    def _handle_agent_message(self, message: AgentMessageEvent) -> None:
-        self.codex_buffers.append_output(
-            f"-----ASSISTANT-----\n{message.message}\n-------------------"
+        self.last_approval_request_type: Literal["exec", "patch"] | None = None
+        self.last_approval_request_submission_id: str | None = None
+
+    def _handle_agent_message(self, id: str, message: AgentMessageEvent) -> None:
+        self.codex_buffers.append_output(f"codex\n{message.message}")
+
+    def _handle_agent_reasoning(self, id: str, message: AgentReasoningEvent) -> None:
+        self.codex_buffers.append_output(f"codex (reasoning)\n{message.text}")
+
+    def _handle_error(self, id: str, message: ErrorEvent) -> None:
+        self.codex_buffers.append_output(f"ERROR\n{message.message}")
+
+    def _handle_task_started(self, id: str, message: TaskStarted) -> None:
+        self.codex_buffers.output_buffer.name = "CODEX output [THINKING...]"
+
+    def _handle_task_completed(self, id: str, message: TaskCompleteEvent) -> None:
+        self.codex_buffers.output_buffer.name = "CODEX output [READY]"
+
+    def _handle_exec_approval_request(
+        self, id: str, message: ExecApprovalRequestEvent
+    ) -> None:
+        self.last_approval_request_type = "exec"
+        self.last_approval_request_submission_id = id
+        self.codex_buffers.show_status_in_input(
+            f"APPROVAL REQUEST: {message.reason}\n"
+            f"[{message.cwd}]$ {' '.join(message.command)}"
         )
 
-    def _handle_agent_reasoning(self, message: AgentReasoningEvent) -> None:
+    def _handle_exec_command_begin(
+        self, id: str, message: ExecCommandBeginEvent
+    ) -> None:
         self.codex_buffers.append_output(
-            f"-----REASONING-----\n{message.text}\n-------------------"
+            f"command (running...)\n$ {' '.join(message.command)}"
         )
 
-    def _handle_error(self, message: ErrorEvent) -> None:
-        pass  # TODO
-
-    def _handle_task_started(self, message: TaskStarted) -> None:
-        pass  # TODO
-
-    def _handle_task_completed(self, message: TaskCompleteEvent) -> None:
-        pass  # TODO
-
-    def _handle_exec_approval_request(self, message: ExecApprovalRequestEvent) -> None:
-        pass  # TODO
-
-    def _handle_exec_command_end(self, message: ExecCommandEndEvent) -> None:
-        pass  # TODO
+    def _handle_exec_command_end(self, id: str, message: ExecCommandEndEvent) -> None:
+        self.codex_buffers.replace_last_output_line(
+            r"command \(running\.\.\.\)",
+            f"command ({'OK' if message.exit_code == 0 else 'ERROR'})",
+        )
 
     def _handle_apply_patch_approval_request(
-        self, message: ApplyPatchApprovalRequestEvent
+        self, id: str, message: ApplyPatchApprovalRequestEvent
     ) -> None:
-        pass  # TODO
+        self.last_approval_request_type = "patch"
+        self.last_approval_request_submission_id = id
+        self.codex_buffers.append_output(str(message))  # TODO
 
-    def _handle_patch_apply_end(self, message: PatchApplyEndEvent) -> None:
-        pass  # TODO
+    def _handle_patch_apply_begin(self, id: str, message: PatchApplyBeginEvent) -> None:
+        self.codex_buffers.append_output(str(message))  # TODO
 
-    def _handle_job_output(self, message: str) -> None:
-        event = Event.from_json(message)
-        #######
-        self.codex_buffers.append_output(str(event))
-        #######
+    def _handle_patch_apply_end(self, id: str, message: PatchApplyEndEvent) -> None:
+        self.codex_buffers.append_output(str(message))  # TODO
+
+    def _handle_job_output(self, message_str: str) -> None:
+        event = Event.from_json(message_str)
         if isinstance(event.message, AgentMessageEvent):
-            self._handle_agent_message(event.message)
+            self._handle_agent_message(event.id, event.message)
         elif isinstance(event.message, AgentReasoningEvent):
-            self._handle_agent_reasoning(event.message)
+            self._handle_agent_reasoning(event.id, event.message)
         elif isinstance(event.message, ErrorEvent):
-            self._handle_error(event.message)
+            self._handle_error(event.id, event.message)
         elif isinstance(event.message, TaskStarted):
-            self._handle_task_started(event.message)
+            self._handle_task_started(event.id, event.message)
         elif isinstance(event.message, TaskCompleteEvent):
-            self._handle_task_completed(event.message)
+            self._handle_task_completed(event.id, event.message)
         elif isinstance(event.message, ExecApprovalRequestEvent):
-            self._handle_exec_approval_request(event.message)
+            self._handle_exec_approval_request(event.id, event.message)
+        elif isinstance(event.message, ExecCommandBeginEvent):
+            self._handle_exec_command_begin(event.id, event.message)
         elif isinstance(event.message, ExecCommandEndEvent):
-            self._handle_exec_command_end(event.message)
+            self._handle_exec_command_end(event.id, event.message)
         elif isinstance(event.message, ApplyPatchApprovalRequestEvent):
-            self._handle_apply_patch_approval_request(event.message)
+            self._handle_apply_patch_approval_request(event.id, event.message)
+        elif isinstance(event.message, PatchApplyBeginEvent):
+            self._handle_patch_apply_begin(event.id, event.message)
         elif isinstance(event.message, PatchApplyEndEvent):
-            self._handle_patch_apply_end(event.message)
+            self._handle_patch_apply_end(event.id, event.message)
+        else:
+            self.codex_buffers.append_output(str(event.message))
 
-    def _send(self, op: SubmissionOperation) -> str:
+    def _send(self, op: SubmissionOperation) -> None:
         submission = Submission(operation=op)
         self._send_to_job(submission.to_json() + "\n")
-        return str(submission.id)
 
-    def interrupt(self) -> str:
-        return self._send(Interrupt())
+    def interrupt(self) -> None:
+        self._send(Interrupt())
 
-    def send_user_message(self):
+    def send_user_message(self) -> None:
         text = "\n".join(self.codex_buffers.input_buffer[:])
         del self.codex_buffers.input_buffer[:]
-        self.codex_buffers.append_output(f"-----USER-----\n{text}\n--------------")
-        return self._send(UserInput([TextInput(text)]))
+        self.codex_buffers.append_output(f"\nuser\n{text}\n")
+        self._send(UserInput([TextInput(text)]))
 
-    def exec_approval(self, id: str, decision: ReviewDecision) -> str:
-        return self._send(ExecApproval(id, ReviewDecision))
-
-    def patch_approval(self, id: str, decision: ReviewDecision) -> str:
-        return self._send(PatchApproval(id, ReviewDecision))
+    def approval(self, decision: ReviewDecision) -> None:
+        if self.last_approval_request_type is not None:
+            if self.last_approval_request_type == "exec":
+                self._send(
+                    ExecApproval(self.last_approval_request_submission_id, decision)
+                )
+            elif self.last_approval_request_type == "patch":
+                self._send(
+                    PatchApproval(self.last_approval_request_submission_id, decision)
+                )
+            self.codex_buffers.hide_status_in_input()
+            self.last_approval_request_type = None
 
     def stop(self) -> None:
         self._stop_job()
@@ -221,8 +278,8 @@ class CodexSession:
 codex_session: CodexSession | None = None
 
 
-def if_session_exists(func):
-    def wrapper():
+def if_session_exists(func) -> Callable:
+    def wrapper() -> None:
         if codex_session is not None:
             func()
         else:
@@ -231,7 +288,7 @@ def if_session_exists(func):
     return wrapper
 
 
-def start_codex_session():
+def start_codex_session() -> None:
     global codex_session
     if codex_session is None:
         codex_session = CodexSession()
@@ -240,12 +297,12 @@ def start_codex_session():
 
 
 @if_session_exists
-def stop_codex_session():
+def stop_codex_session() -> None:
     global codex_session
     codex_session.stop()
     codex_session = None
 
 
 @if_session_exists
-def switch_codex_window():
+def switch_codex_window() -> None:
     codex_session.codex_buffers.switch()
