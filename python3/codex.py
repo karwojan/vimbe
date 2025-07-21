@@ -6,7 +6,9 @@ from typing import Callable, Literal
 import vim
 from codex_protocol_event import (
     AgentMessageEvent,
+    AgentMessageDeltaEvent,
     AgentReasoningEvent,
+    AgentReasoningDeltaEvent,
     ApplyPatchApprovalRequestEvent,
     ErrorEvent,
     Event,
@@ -54,14 +56,7 @@ def find_window(buffer: vim.Buffer) -> vim.Window | None:
 
 
 class CodexBuffers:
-    def __init__(
-        self,
-        input_buffer_setup_commands: list[str] | None = None,
-        output_buffer_setup_commands: list[str] | None = None,
-    ) -> None:
-        self.input_buffer_setup_commands = input_buffer_setup_commands
-        self.output_buffer_setup_commands = output_buffer_setup_commands
-
+    def __init__(self) -> None:
         # vim.buffers is a mapping nr->buffer
         self.output_buffer = vim.buffers[bufadd("")]
         bufload(self.output_buffer.number)
@@ -122,17 +117,9 @@ class CodexBuffers:
         self.output_window.width = 70
         with vim_window(self.output_window):
             vim.command("syntax on")
-            if self.output_buffer_setup_commands is not None:
-                for cmd in self.output_buffer_setup_commands:
-                    vim.command(cmd)
             vim.command(f"below horizontal sbuffer {self.input_buffer.number}")
 
         self.input_window.height = 5
-        with vim_window(self.input_window):
-            if self.input_buffer_setup_commands is not None:
-                for cmd in self.input_buffer_setup_commands:
-                    vim.command(cmd)
-
         vim.current.window = self.input_window
 
     def switch(self) -> None:
@@ -200,19 +187,20 @@ class CodexSession:
         self.session_idx = len(self.sessions)
         self.sessions.append(self)
 
-        # this is necessary as there is no type for Job in python (all the methods
-        # return None instead of Job), so the Job reference can not be hold in python
+        # binding with job interface: this is necessary as there is no type for Job in
+        # python (all the methods return None instead of Job), so the Job reference can
+        # not be hold in python
         vim.command(
             f"""\
-            function HandleCodexJobOutput{self.session_idx}(channel, msg)
+            function! HandleCodexJobOutput{self.session_idx}(channel, msg)
                 py3 codex.CodexSession.sessions[{self.session_idx}]._handle_job_output(vim.eval("a:msg"))
             endfunction
             let g:codex_job{self.session_idx} = job_start(["codex", "proto"], \
                     {{"out_mode": "nl", "out_cb": "HandleCodexJobOutput{self.session_idx}"}})
-            function SendToCodexJob{self.session_idx}(msg)
+            function! SendToCodexJob{self.session_idx}(msg)
                 call ch_sendraw(g:codex_job{self.session_idx}, a:msg)
             endfunction
-            function StopCodexJob{self.session_idx}()
+            function! StopCodexJob{self.session_idx}()
                 call job_stop(g:codex_job{self.session_idx}, "kill")
             endfunction
         """
@@ -220,15 +208,20 @@ class CodexSession:
         self._send_to_job = vim.Function(f"SendToCodexJob{self.session_idx}")
         self._stop_job = vim.Function(f"StopCodexJob{self.session_idx}")
 
-        self.codex_buffers = CodexBuffers(
-            input_buffer_setup_commands=[
-                f"nmap <buffer> <Enter> :py3 codex.CodexSession.sessions[{self.session_idx}].send_user_message()<CR>",
-                f"nmap <buffer> <C-C> :py3 codex.CodexSession.sessions[{self.session_idx}].interrupt()<CR>",
-                f"nmap <buffer> <C-A> :py3 codex.CodexSession.sessions[{self.session_idx}].approval(codex.ReviewDecision.APPROVED)<CR>",
-                f"nmap <buffer> <C-D> :py3 codex.CodexSession.sessions[{self.session_idx}].approval(codex.ReviewDecision.DENIED)<CR>",
-            ]
-        )
+        # create codex buffers
+        self.codex_buffers = CodexBuffers()
         self.codex_buffers.show()
+
+        # setup mappings
+        session = f"codex.CodexSession.sessions[{self.session_idx}]"
+        vim.command(f"noremap <Leader>cS :py3 {session}.stop()<CR>")
+        vim.command(f"noremap <Leader>cc :py3 {session}.codex_buffers.switch()<CR>")
+        vim.command(f"noremap <Leader>cf :py3 {session}.include_context()<CR>")
+        with vim_window(self.codex_buffers.input_window):
+            vim.command(f"nmap <buffer> <Enter> :py3 {session}.send_user_message()<CR>")
+            vim.command(f"nmap <buffer> <C-C> :py3 {session}.interrupt()<CR>")
+            vim.command(f"nmap <buffer> <C-A> :py3 {session}.approval(codex.ReviewDecision.APPROVED)<CR>")
+            vim.command(f"nmap <buffer> <C-D> :py3 {session}.approval(codex.ReviewDecision.DENIED)<CR>")
 
         self.apply_patch_buffer = ApplyPatchBuffer()
 
@@ -238,8 +231,14 @@ class CodexSession:
     def _handle_agent_message(self, id: str, message: AgentMessageEvent) -> None:
         self.codex_buffers.append_output(f"codex\n{message.message}")
 
+    def _handle_agent_message_delta(self, id: str, message: AgentMessageDeltaEvent) -> None:
+        pass # TODO
+
     def _handle_agent_reasoning(self, id: str, message: AgentReasoningEvent) -> None:
         self.codex_buffers.append_output(f"codex (reasoning)\n{message.text}")
+
+    def _handle_agent_reasoning_delta(self, id: str, message: AgentReasoningDeltaEvent) -> None:
+        pass # TODO
 
     def _handle_error(self, id: str, message: ErrorEvent) -> None:
         self.codex_buffers.append_output(f"ERROR\n{message.message}")
@@ -306,8 +305,12 @@ class CodexSession:
         event = Event.from_json(message_str)
         if isinstance(event.message, AgentMessageEvent):
             self._handle_agent_message(event.id, event.message)
+        elif isinstance(event.message, AgentMessageDeltaEvent):
+            self._handle_agent_message_delta(event.id, event.message)
         elif isinstance(event.message, AgentReasoningEvent):
             self._handle_agent_reasoning(event.id, event.message)
+        elif isinstance(event.message, AgentReasoningDeltaEvent):
+            self._handle_agent_reasoning_delta(event.id, event.message)
         elif isinstance(event.message, ErrorEvent):
             self._handle_error(event.id, event.message)
         elif isinstance(event.message, TaskStarted):
@@ -336,6 +339,13 @@ class CodexSession:
     def interrupt(self) -> None:
         self._send(Interrupt())
 
+    def include_context(self) -> None:
+        filename = vim.eval('expand("%")')
+        if len(self.codex_buffers.input_buffer) == 0:
+            self.codex_buffers.input_buffer.append(filename)
+        else:
+            self.codex_buffers.input_buffer[-1] += f" file:{filename} "
+
     def send_user_message(self) -> None:
         text = "\n".join(self.codex_buffers.input_buffer[:])
         del self.codex_buffers.input_buffer[:]
@@ -360,36 +370,12 @@ class CodexSession:
         self._stop_job()
         self.codex_buffers.delete()
         self.apply_patch_buffer.delete()
-
-
-codex_session: CodexSession | None = None
-
-
-def if_session_exists(func) -> Callable:
-    def wrapper() -> None:
-        if codex_session is not None:
-            func()
-        else:
-            print("Codex session does not exist.")
-
-    return wrapper
+        CodexSession.sessions.remove(self)
 
 
 def start_codex_session() -> None:
-    global codex_session
-    if codex_session is None:
-        codex_session = CodexSession()
+    # TODO implement multiple sessions
+    if len(CodexSession.sessions) == 0:
+        CodexSession()
     else:
         print("Codex session already exists.")
-
-
-@if_session_exists
-def stop_codex_session() -> None:
-    global codex_session
-    codex_session.stop()
-    codex_session = None
-
-
-@if_session_exists
-def switch_codex_window() -> None:
-    codex_session.codex_buffers.switch()

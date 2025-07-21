@@ -26,8 +26,12 @@ class EventMessage:
             )
         if t == "agent_message":
             return AgentMessageEvent(message=d.get("message"))
+        if t == "agent_message_delta":
+            return AgentMessageDeltaEvent(delta=d.get("delta"))
         if t == "agent_reasoning":
             return AgentReasoningEvent(text=d.get("text"))
+        if t == "agent_reasoning_delta":
+            return AgentReasoningDeltaEvent(delta=d.get("delta"))
         if t == "session_configured":
             return SessionConfiguredEvent(
                 session_id=d.get("session_id"),
@@ -190,8 +194,18 @@ class AgentMessageEvent(EventMessage):
 
 
 @dataclass
+class AgentMessageDeltaEvent(EventMessage):
+    delta: str
+
+
+@dataclass
 class AgentReasoningEvent(EventMessage):
     text: str
+
+
+@dataclass
+class AgentReasoningDeltaEvent(EventMessage):
+    delta: str
 
 
 @dataclass
