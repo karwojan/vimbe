@@ -1,4 +1,6 @@
 import re
+import subprocess
+from contextlib import contextmanager
 from typing import Callable, Literal
 
 import vim
@@ -11,6 +13,8 @@ from codex_protocol_event import (
     ExecApprovalRequestEvent,
     ExecCommandBeginEvent,
     ExecCommandEndEvent,
+    FileChange,
+    FileChangeType,
     PatchApplyBeginEvent,
     PatchApplyEndEvent,
     TaskCompleteEvent,
@@ -31,6 +35,22 @@ from codex_protocol_submission import (
 bufadd = vim.Function("bufadd")
 bufload = vim.Function("bufload")
 timer_start = vim.Function("timer_start")
+
+
+@contextmanager
+def vim_window(window: vim.Window) -> None:
+    old_current_window = vim.current.window
+    vim.current.window = window
+    try:
+        yield None
+    finally:
+        vim.current.window = old_current_window
+
+
+def find_window(buffer: vim.Buffer) -> vim.Window | None:
+    # vim.windows is a sequence, which we have to search over
+    target_windows = [w for w in vim.windows if w.buffer == buffer]
+    return target_windows[0] if len(target_windows) > 0 else None
 
 
 class CodexBuffers:
@@ -57,21 +77,21 @@ class CodexBuffers:
         self.input_buffer.options["buftype"] = "nofile"
         self.input_buffer.options["swapfile"] = False
 
-    def _find_window(self, buffer: vim.Buffer) -> vim.Window | None:
-        # vim.windows is a sequence, which we have to search over
-        target_windows = [w for w in vim.windows if w.buffer == buffer]
-        return target_windows[0] if len(target_windows) > 0 else None
+    @property
+    def output_window(self) -> vim.Window | None:
+        return find_window(self.output_buffer)
+
+    @property
+    def input_window(self) -> vim.Window | None:
+        return find_window(self.input_buffer)
 
     def append_output(self, text: str) -> None:
         self.output_buffer.options["modifiable"] = True
         self.output_buffer.append(text.splitlines() + [""])
         self.output_buffer.options["modifiable"] = False
-        output_window = self._find_window(self.output_buffer)
-        if output_window is not None and output_window.height > 0:
-            old_current_window = vim.current.window
-            vim.current.window = output_window
-            vim.command("normal G")
-            vim.current.window = old_current_window
+        if self.output_window is not None and self.output_window.height > 0:
+            with vim_window(self.output_window):
+                vim.command("normal G")
 
     def replace_last_output_line(self, pattern: str, repl: str) -> None:
         self.output_buffer.options["modifiable"] = True
@@ -91,39 +111,86 @@ class CodexBuffers:
         self.input_buffer[:] = []
 
     def hide(self) -> None:
-        output_window = self._find_window(self.output_buffer)
-        if output_window is not None:
-            vim.command(f"{output_window.number}hide")
-        input_window = self._find_window(self.input_buffer)
-        if input_window is not None:
-            vim.command(f"{input_window.number}hide")
+        if self.output_window is not None:
+            vim.command(f"{self.output_window.number}hide")
+        if self.input_window is not None:
+            vim.command(f"{self.input_window.number}hide")
 
     def show(self) -> None:
         vim.command(f"botright vertical sbuffer {self.output_buffer.number}")
-        output_window = self._find_window(self.output_buffer)
-        output_window.width = 70
-        vim.current.window = output_window
-        vim.command("syntax on")
-        if self.output_buffer_setup_commands is not None:
-            for cmd in self.output_buffer_setup_commands:
-                vim.command(cmd)
-        vim.command(f"below horizontal sbuffer {self.input_buffer.number}")
-        input_window = self._find_window(self.input_buffer)
-        input_window.height = 5
-        vim.current.window = input_window
-        if self.input_buffer_setup_commands is not None:
-            for cmd in self.input_buffer_setup_commands:
-                vim.command(cmd)
+
+        self.output_window.width = 70
+        with vim_window(self.output_window):
+            vim.command("syntax on")
+            if self.output_buffer_setup_commands is not None:
+                for cmd in self.output_buffer_setup_commands:
+                    vim.command(cmd)
+            vim.command(f"below horizontal sbuffer {self.input_buffer.number}")
+
+        self.input_window.height = 5
+        with vim_window(self.input_window):
+            if self.input_buffer_setup_commands is not None:
+                for cmd in self.input_buffer_setup_commands:
+                    vim.command(cmd)
+
+        vim.current.window = self.input_window
 
     def switch(self) -> None:
-        if (
-            self._find_window(self.input_buffer) is None
-            or self._find_window(self.output_buffer) is None
-        ):
+        if self.input_window is None or self.output_window is None:
             self.hide()  # make sure there is only one instance of windows
             self.show()
         else:
             self.hide()
+
+    def delete(self) -> None:
+        vim.command(f"bdelete {self.output_buffer.number}")
+        vim.command(f"bdelete {self.input_buffer.number}")
+
+
+class ApplyPatchBuffer:
+    def __init__(self) -> None:
+        self.patch_buffer = vim.buffers[bufadd("")]
+        bufload(self.patch_buffer.number)
+        self.patch_buffer.name = "patched"
+        self.patch_buffer.options["buftype"] = "nofile"
+        self.patch_buffer.options["swapfile"] = False
+
+        self.largest_window: vim.Window | None = None
+
+    @property
+    def patch_window(self) -> vim.Window | None:
+        return find_window(self.patch_buffer)
+
+    def _apply_patch_in_memory(self, path: str, unified_diff: str) -> str:
+        p = subprocess.Popen(
+            ["patch", "-i", "-", "-o", "-", path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        stdout, stderr = p.communicate(unified_diff)
+        return stdout
+
+    def show(self, path: str, unified_diff: str) -> None:
+        patched_content = self._apply_patch_in_memory(path, unified_diff)
+        self.patch_buffer[:] = patched_content.splitlines()
+        self.largest_window = max(vim.windows, key=lambda w: w.width)
+        with vim_window(self.largest_window):
+            vim.command(f"edit {path}")
+            vim.command("diffthis")
+            vim.command(f"vertical sbuffer {self.patch_buffer.number}")
+        with vim_window(self.patch_window):
+            vim.command("diffthis")
+
+    def hide(self) -> None:
+        if self.patch_window is not None:
+            with vim_window(self.largest_window):
+                vim.command("diffoff")
+            vim.command(f"{self.patch_window.number}hide")
+
+    def delete(self) -> None:
+        vim.command(f"bdelete {self.patch_buffer.number}")
 
 
 class CodexSession:
@@ -163,6 +230,8 @@ class CodexSession:
         )
         self.codex_buffers.show()
 
+        self.apply_patch_buffer = ApplyPatchBuffer()
+
         self.last_approval_request_type: Literal["exec", "patch"] | None = None
         self.last_approval_request_submission_id: str | None = None
 
@@ -187,7 +256,7 @@ class CodexSession:
         self.last_approval_request_type = "exec"
         self.last_approval_request_submission_id = id
         self.codex_buffers.show_status_in_input(
-            f"APPROVAL REQUEST: {message.reason}\n"
+            f"EXEC APPROVAL REQUEST: {message.reason or ''}\n"
             f"[{message.cwd}]$ {' '.join(message.command)}"
         )
 
@@ -204,12 +273,28 @@ class CodexSession:
             f"command ({'OK' if message.exit_code == 0 else 'ERROR'})",
         )
 
+    def _file_changes_summary(self, changes: dict[str, FileChange]) -> str:
+        return "\n".join(
+            f"{change.type.value} {path}" for path, change in changes.items()
+        )
+
     def _handle_apply_patch_approval_request(
         self, id: str, message: ApplyPatchApprovalRequestEvent
     ) -> None:
         self.last_approval_request_type = "patch"
         self.last_approval_request_submission_id = id
-        self.codex_buffers.append_output(str(message))  # TODO
+        self.codex_buffers.show_status_in_input(
+            f"PATCH APPROVAL REQUEST: {message.reason or ''}\n"
+            + self._file_changes_summary(message.changes)
+        )
+        update_changes = [
+            (p, ch)
+            for p, ch in message.changes.items()
+            if ch.type == FileChangeType.UPDATE
+        ]
+        if len(update_changes) > 0:
+            path, change = next(iter(update_changes))
+            self.apply_patch_buffer.show(path, change.unified_diff)
 
     def _handle_patch_apply_begin(self, id: str, message: PatchApplyBeginEvent) -> None:
         self.codex_buffers.append_output(str(message))  # TODO
@@ -267,12 +352,14 @@ class CodexSession:
                 self._send(
                     PatchApproval(self.last_approval_request_submission_id, decision)
                 )
+                self.apply_patch_buffer.hide()
             self.codex_buffers.hide_status_in_input()
             self.last_approval_request_type = None
 
     def stop(self) -> None:
         self._stop_job()
-        self.codex_buffers.hide()
+        self.codex_buffers.delete()
+        self.apply_patch_buffer.delete()
 
 
 codex_session: CodexSession | None = None

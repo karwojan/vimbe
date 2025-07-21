@@ -138,19 +138,19 @@ class FileChange:
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "FileChange":
-        t = d.get("type")
+        t = next(iter(d.keys()))
         if t == "add":
-            return FileChange(type=FileChangeType.ADD, content=d.get("content"))
-        if t == "delete":
+            return FileChange(type=FileChangeType.ADD, content=d[t]["content"])
+        elif t == "delete":
             return FileChange(type=FileChangeType.DELETE)
-        if t == "update":
+        elif t == "update":
             return FileChange(
                 type=FileChangeType.UPDATE,
-                unified_diff=d.get("unified_diff"),
-                move_path=d.get("move_path"),
+                unified_diff=d[t]["unified_diff"],
+                move_path=d[t]["move_path"],
             )
-        # unknown, default to delete
-        return FileChange(type=FileChangeType.DELETE)
+        else:
+            raise NotImplementedError(f"Change type '{t}' unknown.")
 
 
 @dataclass
